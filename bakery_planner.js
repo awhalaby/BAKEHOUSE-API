@@ -8,6 +8,9 @@
 /***********************
  * 1) Sample datasets  *
  ***********************/
+const horizonHour = 5;
+const horizonMin = horizonHour * 60;
+
 const skuConfig = [
   {
     sku: "WG_CHCR_LQ",
@@ -35,7 +38,7 @@ const ovenConfig = [
 ];
 
 const posData = [
-  { date: "2025-10-21 07:01:00", sku: "WG_CHCR_LQ", qty: 4 },
+  { date: "2025-10-21 07:01:00", sku: "WG_CHCR_LQ", qty: 1 },
   { date: "2025-10-21 07:20:00", sku: "WG_CHCR_LQ", qty: 5 },
   { date: "2025-10-21 07:40:00", sku: "WG_CHCR_LQ", qty: 7 },
   { date: "2025-10-21 08:00:00", sku: "WG_CHCR_LQ", qty: 10 },
@@ -140,23 +143,24 @@ function bucketOven(ovenLogs) {
 // Baseline: average of last same-time buckets (across available history)
 function forecastDemand(sku, slots, posBuckets) {
   const skuBuckets = posBuckets.get(sku) || new Map();
+
+  // group historical demand by slot offset (hour*60 + minute)
+  const bySlotKey = new Map();
+  for (const [k, v] of skuBuckets.entries()) {
+    const d = new Date(Number(k));
+    const slotKey = d.getHours() * 60 + d.getMinutes();
+    if (!bySlotKey.has(slotKey)) bySlotKey.set(slotKey, []);
+    bySlotKey.get(slotKey).push(v);
+  }
+
   const result = new Map();
   for (const t of slots) {
-    const mm = t.getMinutes();
-    const hh = t.getHours();
-
-    // Gather historical buckets with same HH:MM across days
-    let sum = 0, n = 0;
-    for (const [k, v] of skuBuckets.entries()) {
-      const d = new Date(Number(k));
-      if (d.getHours() === hh && d.getMinutes() === mm) {
-        sum += v; n += 1;
-      }
-    }
-    const avg = n > 0 ? sum / n : 0;
+    const slotKey = t.getHours() * 60 + t.getMinutes();
+    const arr = bySlotKey.get(slotKey) || [];
+    const avg = arr.length ? arr.reduce((a,b)=>a+b,0) / arr.length : 0;
     result.set(t.getTime().toString(), avg);
   }
-  return result; // Map(slotTsStr -> demandQty)
+  return result;
 }
 
 /******************************************
@@ -225,7 +229,7 @@ function nextAssignableRack(usedList) {
 /****************************
  * 7) Planner (rolling 3 hrs)
  ****************************/
-function planBakes({ now = new Date("2025-10-22T06:00:00") , horizonMin = 180 }) {
+function planBakes({ now = new Date("2025-10-23T05:00:00") , horizonMin  }) {
   const start = floorToSlot(now);
   const end = addMinutes(start, horizonMin + 1); // inclusive-ish
   const slots = rangeSlots(start, end);
@@ -249,9 +253,26 @@ function planBakes({ now = new Date("2025-10-22T06:00:00") , horizonMin = 180 })
     posCumBySku.set(sku, m);
   }
 
+  
+
+
   // Demand forecast for each sku over horizon
   const demandBySku = new Map();
   for (const sku of skus) demandBySku.set(sku, forecastDemand(sku, slots, posBuckets));
+
+// 2a) Build cumulative *forecast* per slot
+  const forecastCumBySku = new Map(); // sku -> Map(slotTsStr -> cumulative forecast up to *this* slot)
+for (const sku of skus) {
+  const cum = new Map();
+  let running = 0;
+  for (const t of slots) {
+    const key = t.getTime().toString();
+    const f = (demandBySku.get(sku).get(key) || 0);
+    running += f;
+    cum.set(key, running);
+  }
+  forecastCumBySku.set(sku, cum);
+}
 
   // Plans we will add incrementally
   const plannedBatches = new Map(); // sku -> [{tsStart, oven, rack, qty}]
@@ -278,9 +299,14 @@ function planBakes({ now = new Date("2025-10-22T06:00:00") , horizonMin = 180 })
 
       // Sellable stock before POS depletion
       let onHand = computeOnHandAt(sku, t, ovenBySku, plannedBatches);
-      // Deplete by POS sold up to t
-      const soldCum = posCumBySku.get(sku).get(t.getTime().toString()) || 0;
-      onHand = Math.max(0, onHand - soldCum);
+      
+      // Deplete by *forecasted* sales up to the previous slot
+
+      const prevKey = addMinutes(t, -SLOT_MIN).getTime().toString();
+      const soldCumForecast = (forecastCumBySku.get(sku).get(prevKey) || 0);
+      onHand = Math.max(0, onHand - soldCumForecast);
+
+      
 
       const safety = 0; // tweakable per SKU/time
       let shortfall = Math.max(0, demand + safety - onHand);
@@ -336,9 +362,9 @@ function planBakes({ now = new Date("2025-10-22T06:00:00") , horizonMin = 180 })
  * 8) Run & printout *
  *********************/
 if (require.main === module) {
-  const now = new Date("2025-10-22T05:00:00"); // tweak as needed
-  const { plan, actions } = planBakes({ now, horizonMin: 180 });
-  console.log("\n=== RECOMMENDED BAKE SCHEDULE (next 3h) ===\n");
+  const now = new Date("2025-10-23T05:00:00"); // tweak as needed
+  const { plan, actions } = planBakes({ now, horizonMin });
+  console.log(`\n=== RECOMMENDED BAKE SCHEDULE (next ${horizonHour} h) ===\n`);
   for (const p of plan) {
     console.log(
       `${p.start.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} | ${p.oven} r${p.rack} | ${p.sku} x${p.qty} (${p.state})`
